@@ -1341,3 +1341,306 @@ function EmptyState({ text }) {
   );
 }
 
+
+# backend 
+# Sidegig Backend
+
+A real backend for the Sidegig gig marketplace: Node.js + Express + SQLite
+(via `better-sqlite3`), with JWT authentication. It replaces the
+`window.storage` calls in the React artifact with a proper API and database,
+and moves the important rules (who can accept a booking, one review per
+booking, etc.) from the browser into the server, where they can't be
+bypassed.
+
+## 1. Setup
+
+'''bash
+cd sidegig-backend
+npm install
+cp .env.example .env'''
+
+
+Open `.env` and set `JWT_SECRET` to a long random string (e.g. run
+`openssl rand -hex 32` and paste the output). Set `CORS_ORIGIN` to wherever
+your frontend runs, e.g. `http://localhost:5173` for Vite or
+`http://localhost:3000` for Create React App / Next.
+
+```bash
+npm run dev      # starts on http://localhost:4000 with auto-reload
+# or
+npm start
+```
+
+A `sidegig.db` SQLite file is created automatically on first run — no
+separate database server to install. Delete that file any time to reset all
+data.
+
+> **Note on `better-sqlite3`:** it's a native module. `npm install` compiles
+> it (or pulls a prebuilt binary) automatically on Mac/Linux/Windows. If it
+> ever fails to install on your machine, the most common fix is making sure
+> you have a recent Node.js LTS version installed.
+
+## 2. API reference
+
+All request/response bodies are JSON. Protected routes require a header:
+`Authorization: Bearer <token>` (the token you get back from register/login).
+
+### Auth
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/api/auth/register` | `{ name, email, password }` | password ≥ 8 chars. Returns `{ token, user }`. |
+| POST | `/api/auth/login` | `{ email, password }` | Returns `{ token, user }`. |
+| GET | `/api/auth/me` | — | Protected. Returns the logged-in user. |
+
+### Gigs
+| Method | Path | Body / Query | Notes |
+|---|---|---|---|
+| GET | `/api/gigs?search=&category=&sort=` | — | Public. `sort` ∈ `newest,low,high,rating,trending`. |
+| GET | `/api/gigs/:id` | — | Public. |
+| POST | `/api/gigs` | `{ title, category, rate, description, tags[] }` | Protected. Creator = logged-in user. |
+| DELETE | `/api/gigs/:id` | — | Protected. Only the gig's creator. |
+
+### Bookings
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| GET | `/api/bookings/mine` | — | Protected. Bookings you made as a client. |
+| GET | `/api/bookings/received` | — | Protected. Bookings made on gigs you created. |
+| POST | `/api/bookings` | `{ gigId, message }` | Protected. Status starts as `Pending`. |
+| PATCH | `/api/bookings/:id/status` | `{ status }` | Protected. Only the gig's creator; status ∈ `Accepted, Declined, Completed`. |
+| DELETE | `/api/bookings/:id` | — | Protected. Only the client, only while `Pending` (withdraw). |
+
+### Reviews
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| GET | `/api/reviews/gig/:gigId` | — | Public. |
+| POST | `/api/reviews` | `{ bookingId, rating, comment }` | Protected. Only the client on a `Completed` booking, once. |
+
+### Favorites (saved gigs)
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/favorites` | Protected. List of saved gig IDs. |
+| POST | `/api/favorites/:gigId` | Protected. Save a gig. |
+| DELETE | `/api/favorites/:gigId` | Protected. Unsave a gig. |
+
+## 3. Wiring this into the React app
+
+The React component currently reads/writes through `window.storage`, e.g.:
+
+```js
+const r = await window.storage.get(STORAGE_KEYS.gigs, true);
+const g = r ? JSON.parse(r.value) : null;
+```
+
+You'll replace each of those with a `fetch` call to this API instead. A
+small API client makes this a clean swap:
+
+```js
+// api.js
+const API_URL = "http://localhost:4000/api";
+let token = null; // set this after login/register
+
+async function request(path, options = {}) {
+  const res = await fetch(`${API_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed (${res.status})`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+export const api = {
+  setToken: (t) => { token = t; },
+  register: (name, email, password) =>
+    request("/auth/register", { method: "POST", body: JSON.stringify({ name, email, password }) }),
+  login: (email, password) =>
+    request("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
+  getGigs: (params = {}) =>
+    request(`/gigs?${new URLSearchParams(params)}`),
+  postGig: (gig) => request("/gigs", { method: "POST", body: JSON.stringify(gig) }),
+  deleteGig: (id) => request(`/gigs/${id}`, { method: "DELETE" }),
+  createBooking: (gigId, message) =>
+    request("/bookings", { method: "POST", body: JSON.stringify({ gigId, message }) }),
+  setBookingStatus: (id, status) =>
+    request(`/bookings/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  submitReview: (bookingId, rating, comment) =>
+    request("/reviews", { method: "POST", body: JSON.stringify({ bookingId, rating, comment }) }),
+};
+```
+
+Then in the component, e.g. `postGig`:
+
+```js
+// before (window.storage)
+function postGig(gig) {
+  const next = [{ ...gig, id: uid(), createdAt: Date.now() }, ...gigs];
+  setGigs(next);
+  persist(STORAGE_KEYS.gigs, next, true);
+}
+
+// after (real API)
+async function postGig(gig) {
+  const created = await api.postGig(gig); // server assigns id/createdAt/creator
+  setGigs((prev) => [created, ...prev]);
+}
+```
+
+The two biggest structural changes to the React app:
+
+1. **Add a login/register screen.** Right now "creator name" and "client
+   name" are just text inputs. You'll replace them with real sign-up/login
+   forms, store the returned `token` (e.g. in React state or `sessionStorage`
+   on your *own* domain — not inside a Claude artifact), and call
+   `api.setToken(token)` after login.
+2. **Derive "my gigs" / "my bookings" from the server, not from a typed
+   name.** Use `GET /api/bookings/mine` and `GET /api/bookings/received`
+   instead of filtering the full bookings list by a name string.
+
+## 4. Suggested next steps
+
+- Add rate limiting (e.g. `express-rate-limit`) on `/api/auth/*` to slow
+  down brute-force login attempts.
+- Add pagination to `GET /api/gigs` once you have more than a page or two
+  of listings.
+- Swap SQLite for hosted Postgres (Supabase, Neon, Railway) when you're
+  ready to deploy somewhere with multiple server instances.
+- Add Stripe Connect if you want real payments between clients and
+  creators.
+
+
+# -------------------------
+const Database = require("better-sqlite3");
+const path = require("path");
+
+const db = new Database(path.join(__dirname, "..", "sidegig.db"));
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+function initDb() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gigs (
+      id TEXT PRIMARY KEY,
+      creator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      category TEXT NOT NULL,
+      rate REAL NOT NULL CHECK (rate > 0),
+      tags TEXT NOT NULL DEFAULT '[]',
+      description TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bookings (
+      id TEXT PRIMARY KEY,
+      gig_id TEXT NOT NULL REFERENCES gigs(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'Pending'
+        CHECK (status IN ('Pending','Accepted','Completed','Declined')),
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reviews (
+      id TEXT PRIMARY KEY,
+      booking_id TEXT NOT NULL UNIQUE REFERENCES bookings(id) ON DELETE CASCADE,
+      gig_id TEXT NOT NULL REFERENCES gigs(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      comment TEXT DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      gig_id TEXT NOT NULL REFERENCES gigs(id) ON DELETE CASCADE,
+      PRIMARY KEY (user_id, gig_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_gigs_creator ON gigs(creator_id);
+    CREATE INDEX IF NOT EXISTS idx_bookings_gig ON bookings(gig_id);
+    CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(client_id);
+    CREATE INDEX IF NOT EXISTS idx_reviews_gig ON reviews(gig_id);
+  `);
+}
+
+module.exports = { db, initDb };
+
+# ----------------
+const Database = require("better-sqlite3");
+const path = require("path");
+
+const db = new Database(path.join(__dirname, "..", "sidegig.db"));
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+function initDb() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gigs (
+      id TEXT PRIMARY KEY,
+      creator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      category TEXT NOT NULL,
+      rate REAL NOT NULL CHECK (rate > 0),
+      tags TEXT NOT NULL DEFAULT '[]',
+      description TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bookings (
+      id TEXT PRIMARY KEY,
+      gig_id TEXT NOT NULL REFERENCES gigs(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'Pending'
+        CHECK (status IN ('Pending','Accepted','Completed','Declined')),
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reviews (
+      id TEXT PRIMARY KEY,
+      booking_id TEXT NOT NULL UNIQUE REFERENCES bookings(id) ON DELETE CASCADE,
+      gig_id TEXT NOT NULL REFERENCES gigs(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      comment TEXT DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      gig_id TEXT NOT NULL REFERENCES gigs(id) ON DELETE CASCADE,
+      PRIMARY KEY (user_id, gig_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_gigs_creator ON gigs(creator_id);
+    CREATE INDEX IF NOT EXISTS idx_bookings_gig ON bookings(gig_id);
+    CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(client_id);
+    CREATE INDEX IF NOT EXISTS idx_reviews_gig ON reviews(gig_id);
+  `);
+}
+
+module.exports = { db, initDb };
+
+
+
